@@ -38,7 +38,6 @@ from libcst.metadata.position_provider import PositionProvidingCodegenState
 
 from nvidia.dali.types import DALIDataType, DALIImageType, DALIInterpType
 
-from ._call_site import resolve_callsite_frame
 from ._capture import CapturedBatch, CaptureRef
 from ._device import Device
 from ._nvtx import NVTXRange
@@ -575,41 +574,30 @@ class _Classifier:
             return False
 
         binding = self.module_info.binding(name_node)
-        if binding is None or not self._is_binding_invariant(binding, name_node, static=static):
+        if binding is None:
             return False
-
-        # A named mutable is a live handle the user can alias and mutate.
-        # It's hard to prove that they are invariant.
-        return _is_immutable_value(value)
-
-    def _is_binding_invariant(
-        self, binding: Binding, name_node: cst.Name, static: bool = False
-    ) -> bool:
-        """True if `name_node`'s binding is invariant (captured name re-roots at live owner)."""
-        if binding.in_scope:
-            classifier, frame = self, self.frame
-        else:
-            if static:
-                # if it's not assigned in the same scope, then static analysis can't do much
+        if static:
+            if not binding.in_scope or binding.rhs is None:
                 return False
-            if frame := self._live_owner_frame(name_node.value):
-                classifier = _Classifier(self.module_info, frame)
-            else:
+            is_invariant = self.is_invariant(binding.rhs, static=True)
+        else:
+            is_invariant = self._is_binding_invariant(binding, name_node)
+        # A named mutable can be aliased and changed between iterations.
+        return is_invariant and _is_immutable_value(value)
+
+    def _is_binding_invariant(self, binding: Binding, name_node: cst.Name) -> bool:
+        owner = self
+        if not binding.in_scope:
+            owner_frame = self._live_owner_frame(name_node.value)
+            if owner_frame is None:
                 return True  # owner returned: frozen cell
+            owner = _Classifier(self.module_info, owner_frame)
 
         if binding.rhs is None:
-            if static:
-                # Parameters are never statically invariant, since the callee might be called from
-                # multiple sites.
-                # Theoretically we could track lambdas or local functions, but that's not
-                # worth the effort.
-                return False
-            result = classifier._is_param_invariant(name_node, frame)
+            result = owner._is_param_invariant(name_node)
         else:
-            # punch through local assignments
-            result = classifier.is_invariant(binding.rhs, static=static)
-
-        self._merge_required_depth(classifier)
+            result = owner.is_invariant(binding.rhs, static=False)
+        self._merge_required_depth(owner)
         return result
 
     def _live_owner_frame(self, name: str) -> types.FrameType | None:
@@ -621,58 +609,49 @@ class _Classifier:
             frame = frame.f_back
         return None
 
-    def _is_param_invariant(self, name_node: cst.Name, owner_frame: types.FrameType) -> bool:
-        """True if parameter `name_node` of `owner_frame` was passed an invariant argument."""
-        caller = resolve_callsite_frame(owner_frame.f_back)
-        if caller is None:
+    def _is_param_invariant(self, name_node: cst.Name) -> bool:
+        caller = self.frame.f_back
+        param_name = name_node.value
+        if param_name not in self.frame.f_locals or caller is None:
             return False
 
-        info = site_info(caller)  # caller may be in another module
-        if info is None or not isinstance(info.node, cst.Call):
+        caller_info = site_info(caller)
+        if caller_info is None or not isinstance(caller_info.node, cst.Call):
             return False
 
-        call = info.node
-        child = _Classifier(info.module_info, caller)
-        result = child._is_arg_invariant(call, name_node.value, owner_frame.f_code)
-        self._merge_required_depth(child)
-        return result
-
-    def _is_arg_invariant(
-        self, call: cst.Call, param_name: str, callee_code: types.CodeType
-    ) -> bool:
-        """True if `call` binds `param_name` of `callee_code` to an invariant argument."""
-        split = _split_call_args(call)
+        split = _split_call_args(caller_info.node)
         if split is None:
             return False
         pos_nodes, kw_nodes = split
 
         try:
-            callable_obj = _safe_resolve(call.func, self.frame)
+            callable_obj = _safe_resolve(caller_info.node.func, caller)
         except _Unresolved:
             return False
-        if not _matches_callee(callable_obj, callee_code):
+        if not _can_bind_callee(callable_obj, self.frame.f_code):
             return False
 
         try:
-            sig = inspect.signature(callable_obj, follow_wrapped=False)
+            signature = inspect.signature(callable_obj, follow_wrapped=False)
+            bound = signature.bind(*pos_nodes, **kw_nodes)
         except (ValueError, TypeError):
             return False
-
-        param = sig.parameters.get(param_name)
-        if param is None or param.kind in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        ):
+        parameter = signature.parameters.get(param_name)
+        if parameter is None or parameter.kind is inspect.Parameter.VAR_KEYWORD:
             return False
-
-        try:
-            bound = sig.bind(*pos_nodes, **kw_nodes)
-        except TypeError:
-            return False
-
-        if param_name not in bound.arguments:
-            return param.default is not inspect.Parameter.empty  # omitted: frozen default
-        return self.is_invariant(bound.arguments[param_name], static=False)
+        child = _Classifier(caller_info.module_info, caller)
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            nodes = bound.arguments.get(param_name, ())
+            # A partial may have supplied values absent from the call expression.
+            if len(nodes) != len(self.frame.f_locals[param_name]):
+                return False
+            result = all(child.is_invariant(node, static=False) for node in nodes)
+        elif param_name in bound.arguments:
+            result = child.is_invariant(bound.arguments[param_name], static=False)
+        else:
+            result = parameter.default is not inspect.Parameter.empty  # omitted: frozen default
+        self._merge_required_depth(child)
+        return result
 
     def _is_dali_chain(self, node: cst.Attribute) -> bool:
         """The only supported exceptions for attributes are those
@@ -709,12 +688,18 @@ def _split_call_args(
     return pos, kw
 
 
-def _matches_callee(obj: Any, callee_code: types.CodeType) -> bool:
-    """Check that `obj` actually matches the function we're expecting to be in"""
+def _can_bind_callee(obj: Any, callee_code: types.CodeType) -> bool:
+    """Whether the callable matches the executing code and has no signature overrides."""
+    # Signature overrides can map source arguments to the wrong parameters.
+    if (
+        inspect.getattr_static(obj, "__signature__", None) is not None
+        or inspect.getattr_static(obj, "__text_signature__", None) is not None
+    ):
+        return False
     if isinstance(obj, types.MethodType):
-        return _matches_callee(obj.__func__, callee_code)
+        return _can_bind_callee(obj.__func__, callee_code)
     if isinstance(obj, functools.partial):
-        return _matches_callee(obj.func, callee_code)
+        return _can_bind_callee(obj.func, callee_code)
     return isinstance(obj, types.FunctionType) and obj.__code__ is callee_code
 
 
@@ -722,7 +707,6 @@ def classify(
     frame: types.FrameType,
     inputs: tuple[Any, ...],
     raw_kwargs: dict[str, Any],
-    static: bool = False,
 ) -> tuple[list[CaptureRef | Any], dict[str, CaptureRef | Any], int] | None:
     """Classify operator args as captured constants / CaptureRefs, or None to run eager."""
     mi = _get_module_info(frame.f_code)
@@ -740,7 +724,10 @@ def _classify_site(
     raw_kwargs: Mapping[str, Any],
 ) -> tuple[list[bool], set[str]] | None:
     """Memoized `detect_invariant_args` at `frame`'s site, or None if the site is unresolved."""
-    if frame is None or not (info := site_info(frame)):
+    if frame is None:
+        return None
+    info = site_info(frame)
+    if info is None:
         return None
     if key not in info.meta:
         classifier = _Classifier(info.module_info, frame)
