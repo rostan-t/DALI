@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import gc
 import importlib.util
 import os
 import pathlib
@@ -23,10 +24,10 @@ import numpy as np
 from ndd_utils import _is_captured
 from nose_utils import assert_raises
 from test_utils import get_dali_extra_path
-import gc
 
 import nvidia.dali.experimental.dynamic as ndd
 import nvidia.dali.types
+from nvidia.dali.experimental.dynamic._call_site import mark_transparent
 from nvidia.dali.types import DALIDataType
 
 dali_extra_path = get_dali_extra_path()
@@ -270,6 +271,19 @@ def test_param_chained(images):
         return inner(imgs, angle)
 
     return outer(images, 60)
+
+
+@captured_test(expect_captured=True)
+def test_param_varargs(images):
+    def resize(imgs, size):
+        return ndd.resize(imgs, size=size)
+
+    @mark_transparent
+    def forward(imgs, *size):
+        return resize(imgs, size)
+
+    width = 128
+    return forward(images, 40 + 24, width)
 
 
 @captured_test(expect_captured=True)
@@ -537,14 +551,6 @@ def test_param_mutable(images):
         return ndd.resize(imgs, size=size)
 
     return resize(images, [224, 224])
-
-
-@captured_test(expect_captured=False)
-def test_param_varargs(images):
-    def resize(imgs, *size):
-        return ndd.resize(imgs, size=size)
-
-    return resize(images, 224, 224)
 
 
 @captured_test(expect_captured=False)
